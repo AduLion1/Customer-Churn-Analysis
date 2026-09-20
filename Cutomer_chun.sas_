@@ -1,0 +1,302 @@
+/* CUSTOMER CHURN PROJECT */
+
+/* IMPORT FILE */
+proc import datafile="/home/u64487242/Myproject/customer_churn_dataset-testing-master.csv"
+    out=churn
+    dbms=csv
+    replace;
+    getnames=yes;
+    guessingrows=max;
+run;
+
+proc contents data=churn;
+run;
+
+
+/* RENAME COLUMNS + CREATE DERIVED FEATURES */
+data churn_clean;
+    set churn(rename=(
+        'Contract Length'n = Contract_Length
+        'Last Interaction'n = Last_Interaction
+        'Payment Delay'n = Payment_Delay
+        'Subscription Type'n = Subscription_Type
+        'Support Calls'n = Support_Calls
+        'Total Spend'n = Total_Spend
+        'Usage Frequency'n = Usage_Frequency
+    ));
+
+    /* Derived feature: spend per month of tenure */
+    if Tenure > 0 then avg_monthly_spend = Total_Spend / Tenure;
+    else avg_monthly_spend = Total_Spend;
+
+    /* Tenure buckets */
+    length tenure_bucket $10;
+
+    if Tenure < 12 then tenure_bucket = '0-1yr';
+    else if Tenure < 36 then tenure_bucket = '1-3yr';
+    else tenure_bucket = '3yr+';
+
+    /* Flag high payment delay */
+    if Payment_Delay > 20 then high_delay_flag = 1;
+    else high_delay_flag = 0;
+run;
+
+proc contents data=churn_clean;
+run;
+
+
+/* DATA QUALITY CHECK */
+proc print data=churn_clean(obs=10);
+run;
+
+proc means data=churn_clean n nmiss;
+    var Age Tenure Usage_Frequency Support_Calls
+        Payment_Delay Total_Spend Last_Interaction;
+run;
+
+
+/* DESCRIPTIVE STATS CHECK */
+proc means data=churn_clean n mean median std min max maxdec=2;
+    var Age Tenure Usage_Frequency Support_Calls Payment_Delay
+        Total_Spend Last_Interaction avg_monthly_spend;
+run;
+
+proc freq data=churn_clean;
+    tables Churn Gender Subscription_Type Contract_Length
+           tenure_bucket high_delay_flag / chisq;
+run;
+
+
+/* CHURN ANALYSIS */
+proc freq data=churn_clean;
+    tables Contract_Length*Churn / chisq;
+    tables Subscription_Type*Churn / chisq;
+    tables Gender*Churn / chisq;
+    tables tenure_bucket*Churn / chisq;
+    tables high_delay_flag*Churn / chisq;
+run;
+
+
+/* CORRELATION ANALYSIS */
+proc corr data=churn_clean pearson;
+    var Age Tenure Usage_Frequency Support_Calls
+        Payment_Delay Total_Spend Last_Interaction
+        avg_monthly_spend;
+run;
+
+
+/* LOGISTIC REGRESSION - BUILD MODEL */
+proc logistic data=churn_clean plots=roc;
+    class Gender Subscription_Type Contract_Length tenure_bucket / param=ref;
+
+    model Churn(event='1') = Age Tenure Usage_Frequency Support_Calls
+                              Payment_Delay avg_monthly_spend
+                              Gender Subscription_Type Contract_Length tenure_bucket
+                              / selection=stepwise
+                                slentry=0.05
+                                slstay=0.05
+                                clodds=pl;
+run;
+
+
+/* SAVE PREDICTED PROBABILITIES */
+proc logistic data=churn_clean;
+    class Gender Subscription_Type Contract_Length tenure_bucket / param=ref;
+
+    model Churn(event='1') = Age Tenure Usage_Frequency Support_Calls
+                              Payment_Delay avg_monthly_spend
+                              Gender Subscription_Type Contract_Length tenure_bucket
+                              / selection=stepwise
+                                slentry=0.05
+                                slstay=0.05
+                                clodds=pl;
+
+    output out=scored
+        p=churn_probability
+        xbeta=logit_score;
+run;
+
+
+/* CLASSIFY CUSTOMERS */
+data scored;
+    set scored;
+
+    if churn_probability >= 0.50 then predicted_churn = 1;
+    else predicted_churn = 0;
+run;
+
+
+/* CONFUSION MATRIX */
+proc freq data=scored;
+    tables Churn*predicted_churn / norow nocol nopercent;
+run;
+
+
+/* RANK CUSTOMERS INTO RISK DECILES */
+proc rank data=scored groups=10 out=risk_deciles descending;
+    var churn_probability;
+    ranks risk_decile;
+run;
+
+
+/* CREATE RISK LEVEL */
+data risk_deciles;
+    set risk_deciles;
+
+    length risk_level $15;
+
+    if risk_decile = 0 then risk_level = "Very High";
+    else if risk_decile <= 2 then risk_level = "High";
+    else if risk_decile <= 5 then risk_level = "Medium";
+    else risk_level = "Low";
+run;
+
+
+/* LIFT TABLE */
+proc sql noprint;
+    select mean(Churn)
+    into :overall_churn_rate
+    from risk_deciles;
+quit;
+
+proc means data=risk_deciles noprint;
+    class risk_decile;
+    var Churn;
+
+    output out=lift_summary
+        mean=actual_churn_rate
+        n=customer_count;
+run;
+
+data lift_summary;
+    set lift_summary;
+
+    if not missing(risk_decile);
+
+    overall_churn_rate = &overall_churn_rate;
+    lift = actual_churn_rate / overall_churn_rate;
+    lift_percent = lift * 100;
+run;
+
+proc print data=lift_summary noobs;
+    title "Lift Table: Actual Churn Rate by Risk Decile";
+
+    var risk_decile customer_count actual_churn_rate
+        overall_churn_rate lift lift_percent;
+
+    format actual_churn_rate overall_churn_rate 8.2
+           lift 8.2
+           lift_percent 8.1;
+run;
+
+title;
+
+
+/* PROFILE THE TOP RISK DECILE */
+proc means data=risk_deciles mean median std min max maxdec=2;
+    where risk_decile = 0;
+
+    var Age Tenure Usage_Frequency Support_Calls
+        Payment_Delay Total_Spend Last_Interaction
+        avg_monthly_spend;
+
+    title "Profile of Highest-Risk Decile";
+run;
+
+title;
+
+
+/* CATEGORY BREAKDOWN OF TOP RISK DECILE */
+proc freq data=risk_deciles;
+    where risk_decile = 0;
+
+    tables Gender Subscription_Type Contract_Length;
+    title "Category Breakdown of Highest-Risk Decile";
+run;
+
+title;
+
+
+/* TOP RISK CUSTOMERS */
+proc sort data=risk_deciles out=top_risk_customers;
+    by descending churn_probability;
+run;
+
+proc print data=top_risk_customers(obs=20) noobs;
+    var churn_probability risk_level Age Tenure Support_Calls
+        Payment_Delay Total_Spend avg_monthly_spend
+        Contract_Length Subscription_Type Churn;
+
+    format churn_probability percent8.2;
+
+    title "Top 20 Highest-Risk Customers";
+run;
+
+title;
+
+
+/* EXPORT SCORED DATA FOR POWER BI */
+proc export data=risk_deciles
+    outfile="/home/u64487242/Myproject/churn_scored.csv"
+    dbms=csv
+    replace;
+run;
+
+
+/* EXPORT LIFT TABLE */
+proc export data=lift_summary
+    outfile="/home/u64487242/Myproject/churn_lift_table.csv"
+    dbms=csv
+    replace;
+run;
+
+
+/* EXPORT TOP RISK CUSTOMERS */
+proc export data=top_risk_customers
+    outfile="/home/u64487242/Myproject/top_risk_customers.csv"
+    dbms=csv
+    replace;
+run;
+
+
+/* SAVE SAS RESULTS AS PDF */
+ods pdf file="/home/u64487242/Myproject/customer_churn_results.pdf";
+
+proc means data=churn_clean n mean median std min max maxdec=2;
+    var Age Tenure Usage_Frequency Support_Calls Payment_Delay
+        Total_Spend Last_Interaction avg_monthly_spend;
+run;
+
+proc freq data=churn_clean;
+    tables Churn Gender Subscription_Type Contract_Length
+           tenure_bucket high_delay_flag;
+run;
+
+proc logistic data=churn_clean plots=roc;
+    class Gender Subscription_Type Contract_Length tenure_bucket / param=ref;
+
+    model Churn(event='1') = Age Tenure Usage_Frequency Support_Calls
+                              Payment_Delay avg_monthly_spend
+                              Gender Subscription_Type Contract_Length tenure_bucket
+                              / selection=stepwise
+                                slentry=0.05
+                                slstay=0.05
+                                clodds=pl;
+run;
+
+proc print data=lift_summary noobs;
+    title "Lift Table: Actual Churn Rate by Risk Decile";
+    var risk_decile customer_count actual_churn_rate
+        overall_churn_rate lift lift_percent;
+run;
+
+proc print data=top_risk_customers(obs=20) noobs;
+    title "Top 20 Highest-Risk Customers";
+    var churn_probability risk_level Age Tenure Support_Calls
+        Payment_Delay Total_Spend avg_monthly_spend
+        Contract_Length Subscription_Type Churn;
+run;
+
+title;
+
+ods pdf close;
